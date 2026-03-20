@@ -31,8 +31,18 @@ Tokens need scope to read public user data and use search (classic: no extra sco
 npm run dev
 ```
 
-- Frontend: http://localhost:5173 (proxies `/api` → backend)
+- Frontend: http://localhost:5173 (proxies `/api` → backend). If Vite exits with “port already in use”, stop whatever is bound to **5173** (another Vite app, old terminal) and retry.
 - API: http://localhost:3001
+
+**Preview production build** (still proxies `/api` if the backend is on 3001):
+
+```bash
+npm run build
+npm run dev -w backend   # terminal 1 — keep running
+npm run preview -w frontend   # terminal 2 → http://localhost:4173
+```
+
+If you serve the static `frontend/dist` from another host, set `VITE_API_BASE_URL` before build (e.g. `http://localhost:3001`) so the browser calls the API directly; configure backend `CORS_ORIGINS` accordingly.
 
 ### API
 

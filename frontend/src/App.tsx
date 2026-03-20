@@ -1,4 +1,5 @@
 import { useCallback, useMemo, useState } from "react";
+import { apiUrl } from "./apiBase";
 import type { PersonContact, SearchResponse } from "./types";
 
 const defaultQuery = 'location:"United States" language:TypeScript type:user';
@@ -128,7 +129,7 @@ export default function App() {
       setError("Add at least one token (or use backend .env GITHUB_TOKENS).");
       return;
     }
-    const res = await fetch("/api/tokens", {
+    const res = await fetch(apiUrl("/api/tokens"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ tokens: tokenList }),
@@ -148,7 +149,7 @@ export default function App() {
     setError(null);
     try {
       const params = new URLSearchParams({ q: query, page: String(page), perPage: String(perPage) });
-      const res = await fetch(`/api/search?${params}`);
+      const res = await fetch(apiUrl(`/api/search?${params}`));
       const j = await res.json().catch(() => ({}));
       if (!res.ok) {
         setError(typeof j.error === "string" ? j.error : res.statusText);
