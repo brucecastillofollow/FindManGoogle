@@ -32,6 +32,7 @@ npm run dev
 ```
 
 - Frontend: http://localhost:5173 (proxies `/api` → backend). If Vite exits with “port already in use”, stop whatever is bound to **5173** (another Vite app, old terminal) and retry.
+- **Saved table** (`/saved`): save search results to a table in the browser with a **note** per person (stored in `localStorage` on this machine).
 - API: http://localhost:3001
 
 **Preview production build** (still proxies `/api` if the backend is on 3001):
