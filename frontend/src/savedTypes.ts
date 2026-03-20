@@ -1,6 +1,6 @@
 import type { PersonContact } from "./types";
 
-/** One saved row: snapshot of profile + your note (persisted in localStorage). */
+/** One saved row: snapshot of profile + your note (persisted in backend SQLite via API). */
 export interface SavedPersonRow {
   login: string;
   note: string;

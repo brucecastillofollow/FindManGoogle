@@ -44,3 +44,11 @@ export interface SearchResponse {
   perPage: number;
   usedTokens: number;
 }
+
+/** Saved row returned by GET /api/saved and stored in SQLite. */
+export interface SavedPersonRow {
+  login: string;
+  note: string;
+  savedAt: string;
+  person: PersonContact;
+}
