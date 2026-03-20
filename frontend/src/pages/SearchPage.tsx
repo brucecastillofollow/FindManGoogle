@@ -3,9 +3,12 @@ import { Link } from "react-router-dom";
 import { apiUrl } from "../apiBase";
 import { PersonCard } from "../components/PersonCard";
 import { useSavedPeople } from "../SavedPeopleContext";
-import type { SearchResponse } from "../types";
+import type { SearchHistoryRow, SearchResponse } from "../types";
 
 const defaultQuery = 'location:"United States" type:user';
+
+/** GitHub Search API: max `per_page` for user search (also our UI cap). */
+export const GITHUB_SEARCH_MAX_PER_PAGE = 30;
 
 type AutomatedSnapshot = {
   ok: boolean;
@@ -16,13 +19,59 @@ type AutomatedSnapshot = {
   error: string | null;
   perPage: number | null;
   savedToDbCount: number | null;
+  /** GitHub Search API page for this automated run (backend cycles pages between runs). */
+  searchPage?: number | null;
+};
+
+type GithubRateLimitRow = {
+  resource: string;
+  limit: number | null;
+  remaining: number | null;
+  used: number | null;
+  reset: number | null;
+  updatedAt: string;
+  secondsUntilReset: number | null;
+  resetAtIso: string | null;
+};
+
+type PerTokenRateLimitRow = GithubRateLimitRow & {
+  tokenSuffix: string;
+};
+
+type AutomatedCooldownInfo = {
+  enabled: boolean;
+  cooldownMs: number;
+  inCooldown: boolean;
+  nextAllowedAt: string | null;
+  msRemaining: number;
+  lastRunAt: string | null;
+  lastSavedToDb: number | null;
+  /** When the backend will start the next automatic search (if not paused). */
+  nextScheduledRunAt?: string | null;
+  note: string;
 };
 
 type StatsResponse = {
   automated: AutomatedSnapshot;
+  automatedCooldown: AutomatedCooldownInfo;
+  automaticSearchPaused?: boolean;
+  githubRateLimits: GithubRateLimitRow[];
+  githubRateLimitsByToken?: PerTokenRateLimitRow[];
   contactedCount: number;
   savedTotal: number;
 };
+
+function formatDurationMs(ms: number): string {
+  if (ms <= 0) return "0s";
+  const s = Math.floor(ms / 1000);
+  const m = Math.floor(s / 60);
+  const h = Math.floor(m / 60);
+  const sec = s % 60;
+  const min = m % 60;
+  if (h > 0) return `${h}h ${min}m ${sec}s`;
+  if (m > 0) return `${m}m ${sec}s`;
+  return `${sec}s`;
+}
 
 export default function SearchPage() {
   const {
@@ -36,8 +85,10 @@ export default function SearchPage() {
 
   const [stats, setStats] = useState<StatsResponse | null>(null);
   const [statsLoading, setStatsLoading] = useState(true);
+  const [autoControlBusy, setAutoControlBusy] = useState(false);
 
-  const fetchStats = useCallback(async () => {
+  const fetchStats = useCallback(async (opts?: { silent?: boolean }) => {
+    if (!opts?.silent) setStatsLoading(true);
     try {
       const res = await fetch(apiUrl("/api/stats"));
       if (!res.ok) return;
@@ -46,9 +97,33 @@ export default function SearchPage() {
     } catch {
       /* ignore */
     } finally {
-      setStatsLoading(false);
+      if (!opts?.silent) setStatsLoading(false);
     }
   }, []);
+
+  const [searchHistory, setSearchHistory] = useState<SearchHistoryRow[]>([]);
+  const [searchHistoryLoading, setSearchHistoryLoading] = useState(true);
+
+  const fetchSearchHistory = useCallback(async (opts?: { silent?: boolean }) => {
+    if (!opts?.silent) setSearchHistoryLoading(true);
+    try {
+      const res = await fetch(apiUrl("/api/search/history?limit=10"));
+      if (!res.ok) {
+        setSearchHistory([]);
+        return;
+      }
+      const j = (await res.json()) as { rows?: SearchHistoryRow[] };
+      setSearchHistory(Array.isArray(j.rows) ? j.rows : []);
+    } catch {
+      setSearchHistory([]);
+    } finally {
+      if (!opts?.silent) setSearchHistoryLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void fetchSearchHistory();
+  }, [fetchSearchHistory]);
 
   const githubMatchesDisplay = useMemo(() => {
     if (statsLoading && !stats?.automated?.ranAt) return null;
@@ -58,22 +133,53 @@ export default function SearchPage() {
     return "—";
   }, [stats, statsLoading]);
 
+  const [clock, setClock] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setClock((c) => c + 1), 1000);
+    return () => clearInterval(id);
+  }, []);
+
   useEffect(() => {
     void fetchStats();
     // Auto-search runs ~750ms after backend start; refresh stats + saved rows after it can finish.
     const t1 = setTimeout(() => {
       void fetchStats();
       void refreshSaved();
+      void fetchSearchHistory({ silent: true });
     }, 1200);
     const t2 = setTimeout(() => {
       void fetchStats();
       void refreshSaved();
+      void fetchSearchHistory({ silent: true });
     }, 3500);
     return () => {
       clearTimeout(t1);
       clearTimeout(t2);
     };
-  }, [fetchStats, refreshSaved]);
+  }, [fetchStats, refreshSaved, fetchSearchHistory]);
+
+  useEffect(() => {
+    const id = setInterval(() => {
+      void fetchStats({ silent: true });
+      void refreshSaved();
+      void fetchSearchHistory({ silent: true });
+    }, 5000);
+    return () => clearInterval(id);
+  }, [fetchStats, refreshSaved, fetchSearchHistory]);
+
+  const automatedCooldownLeftMs = useMemo(() => {
+    void clock;
+    const c = stats?.automatedCooldown;
+    if (!c?.inCooldown || !c.nextAllowedAt) return 0;
+    return Math.max(0, new Date(c.nextAllowedAt).getTime() - Date.now());
+  }, [stats?.automatedCooldown, clock]);
+
+  const nextAutoRunInMs = useMemo(() => {
+    void clock;
+    const iso = stats?.automatedCooldown?.nextScheduledRunAt;
+    if (!iso) return null as number | null;
+    return Math.max(0, new Date(iso).getTime() - Date.now());
+  }, [stats?.automatedCooldown?.nextScheduledRunAt, clock]);
 
   const contactedCount = useMemo(() => {
     if (!savedLoading) {
@@ -92,8 +198,24 @@ export default function SearchPage() {
   const [perPage, setPerPage] = useState(15);
   const [tokensText, setTokensText] = useState("");
   const [loading, setLoading] = useState(false);
+  const [searchElapsedSec, setSearchElapsedSec] = useState(0);
+  const [searchProgress, setSearchProgress] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<SearchResponse | null>(null);
+
+  useEffect(() => {
+    if (!loading) {
+      setSearchElapsedSec(0);
+      setSearchProgress(0);
+      return;
+    }
+    const t0 = Date.now();
+    const id = window.setInterval(() => {
+      setSearchElapsedSec((Date.now() - t0) / 1000);
+      setSearchProgress((p) => Math.min(92, p + 1.2 + Math.random() * 2));
+    }, 100);
+    return () => clearInterval(id);
+  }, [loading]);
 
   const tokenList = useMemo(
     () =>
@@ -138,18 +260,43 @@ export default function SearchPage() {
         return;
       }
       setResult(j as SearchResponse);
+      void fetchSearchHistory();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
       setResult(null);
     } finally {
       setLoading(false);
     }
-  }, [query, page, perPage]);
+  }, [query, page, perPage, fetchSearchHistory]);
 
   const saveCurrentPage = useCallback(async () => {
     if (!result?.people.length) return;
     await Promise.all(result.people.map((p) => addOrUpdatePerson(p)));
   }, [result, addOrUpdatePerson]);
+
+  const pauseAutomaticSearch = useCallback(async () => {
+    setAutoControlBusy(true);
+    try {
+      const res = await fetch(apiUrl("/api/automated-search/pause"), { method: "POST" });
+      if (!res.ok) return;
+      await fetchStats({ silent: true });
+    } finally {
+      setAutoControlBusy(false);
+    }
+  }, [fetchStats]);
+
+  const resumeAutomaticSearch = useCallback(async () => {
+    setAutoControlBusy(true);
+    try {
+      const res = await fetch(apiUrl("/api/automated-search/resume"), { method: "POST" });
+      if (!res.ok) return;
+      await fetchStats();
+      void refreshSaved();
+      setTimeout(() => void refreshSaved(), 2500);
+    } finally {
+      setAutoControlBusy(false);
+    }
+  }, [fetchStats, refreshSaved]);
 
   return (
     <div style={{ maxWidth: 1100, margin: "0 auto", padding: "1.5rem" }}>
@@ -172,29 +319,150 @@ export default function SearchPage() {
           background: "var(--panel)",
           border: "1px solid var(--border)",
           borderRadius: 10,
+        }}
+      >
+        <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", justifyContent: "space-between", gap: "0.5rem", marginBottom: "0.75rem" }}>
+          <strong style={{ fontSize: "0.95rem" }}>Recent search history</strong>
+          <button
+            type="button"
+            onClick={() => void fetchSearchHistory()}
+            disabled={searchHistoryLoading}
+            style={{ padding: "0.3rem 0.6rem", borderRadius: 6, fontSize: "0.85rem", cursor: searchHistoryLoading ? "wait" : "pointer" }}
+          >
+            Refresh
+          </button>
+        </div>
+        <p style={{ margin: "0 0 0.75rem", fontSize: "0.85rem", color: "var(--muted)" }}>
+          Last <strong>10</strong> profiles returned from any search (manual or automated), newest first. Stored in SQLite.
+        </p>
+        {searchHistoryLoading && !searchHistory.length ? (
+          <p style={{ margin: 0, fontSize: "0.9rem", color: "var(--muted)" }}>Loading…</p>
+        ) : searchHistory.length === 0 ? (
+          <p style={{ margin: 0, fontSize: "0.9rem", color: "var(--muted)" }}>
+            No history yet — run a search below or use automated search (when tokens are set).
+          </p>
+        ) : (
+          <div style={{ overflowX: "auto" }}>
+            <table
+              style={{
+                width: "100%",
+                borderCollapse: "collapse",
+                fontSize: "0.82rem",
+              }}
+            >
+              <thead>
+                <tr style={{ borderBottom: "1px solid var(--border)", textAlign: "left" }}>
+                  <th style={{ padding: "0.45rem 0.5rem", whiteSpace: "nowrap" }}>Login</th>
+                  <th style={{ padding: "0.45rem 0.5rem", whiteSpace: "nowrap" }}>Name</th>
+                  <th style={{ padding: "0.45rem 0.5rem" }}>Location</th>
+                  <th style={{ padding: "0.45rem 0.5rem" }}>Email</th>
+                  <th style={{ padding: "0.45rem 0.5rem", minWidth: 140 }}>Query</th>
+                  <th style={{ padding: "0.45rem 0.5rem", whiteSpace: "nowrap" }}>When</th>
+                </tr>
+              </thead>
+              <tbody>
+                {searchHistory.map((row) => {
+                  const p = row.person;
+                  return (
+                    <tr key={`${row.id}-${row.login}`} style={{ borderBottom: "1px solid var(--border)" }}>
+                      <td style={{ padding: "0.4rem 0.5rem", fontWeight: 600 }}>
+                        <a href={p.githubUrl} target="_blank" rel="noreferrer">
+                          {p.login}
+                        </a>
+                      </td>
+                      <td style={{ padding: "0.4rem 0.5rem" }}>{p.name ?? "—"}</td>
+                      <td style={{ padding: "0.4rem 0.5rem", maxWidth: 220 }}>{p.location ?? "—"}</td>
+                      <td style={{ padding: "0.4rem 0.5rem", maxWidth: 180, wordBreak: "break-all" }}>{p.email ?? "—"}</td>
+                      <td style={{ padding: "0.4rem 0.5rem", maxWidth: 280, wordBreak: "break-word" }}>
+                        <code style={{ fontSize: "0.75rem" }}>{row.query.length > 90 ? `${row.query.slice(0, 90)}…` : row.query}</code>
+                      </td>
+                      <td style={{ padding: "0.4rem 0.5rem", color: "var(--muted)", whiteSpace: "nowrap" }}>
+                        {new Date(row.searchedAt).toLocaleString()}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
+
+      <section
+        style={{
+          marginBottom: "1.5rem",
+          padding: "1rem",
+          background: "var(--panel)",
+          border: "1px solid var(--border)",
+          borderRadius: 10,
           display: "grid",
           gap: "0.75rem",
         }}
       >
         <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", justifyContent: "space-between", gap: "0.5rem" }}>
           <strong style={{ fontSize: "0.95rem" }}>Overview</strong>
-          <button
-            type="button"
-            onClick={() => {
-              setStatsLoading(true);
-              void fetchStats();
-              void refreshSaved();
-            }}
-            style={{ padding: "0.3rem 0.6rem", borderRadius: 6, fontSize: "0.85rem", cursor: "pointer" }}
-          >
-            Refresh metrics
-          </button>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: "0.5rem", alignItems: "center" }}>
+            <span style={{ fontSize: "0.8rem", color: "var(--muted)" }}>
+              Automatic search:{" "}
+              <strong style={{ color: stats?.automaticSearchPaused ? "var(--err)" : "var(--ok)" }}>
+                {stats?.automaticSearchPaused ? "Paused" : "Active"}
+              </strong>
+            </span>
+            {stats?.automaticSearchPaused ? (
+              <button
+                type="button"
+                disabled={autoControlBusy}
+                onClick={() => void resumeAutomaticSearch()}
+                style={{
+                  padding: "0.3rem 0.65rem",
+                  borderRadius: 6,
+                  fontSize: "0.85rem",
+                  cursor: autoControlBusy ? "wait" : "pointer",
+                  border: "1px solid var(--ok)",
+                  background: "rgba(63, 185, 80, 0.12)",
+                  color: "var(--ok)",
+                  fontWeight: 600,
+                }}
+              >
+                Resume automatic search
+              </button>
+            ) : (
+              <button
+                type="button"
+                disabled={autoControlBusy}
+                onClick={() => void pauseAutomaticSearch()}
+                style={{
+                  padding: "0.3rem 0.65rem",
+                  borderRadius: 6,
+                  fontSize: "0.85rem",
+                  cursor: autoControlBusy ? "wait" : "pointer",
+                  border: "1px solid var(--muted)",
+                  background: "var(--panel)",
+                  color: "var(--text)",
+                }}
+              >
+                Pause automatic search
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => {
+                void fetchStats();
+                void refreshSaved();
+                void fetchSearchHistory({ silent: true });
+              }}
+              style={{ padding: "0.3rem 0.6rem", borderRadius: 6, fontSize: "0.85rem", cursor: "pointer" }}
+            >
+              Refresh metrics
+            </button>
+          </div>
         </div>
         <p style={{ margin: 0, fontSize: "0.85rem", color: "var(--muted)" }}>
-          On server start the backend runs an automated search (page 1, configurable <code>AUTO_SEARCH_PER_PAGE</code>, max
-          30), enriches those users (same as manual search), and <strong>upserts them into SQLite</strong>. One Search API
-          call plus one Users call per profile — tune <code>AUTO_SEARCH_PER_PAGE</code> to balance results vs rate limits.{" "}
-          <strong>Contacted</strong> means saved rows with a non-empty <strong>note</strong>.
+          After the backend is up, it runs an automated search (~0.75s delay), then <strong>schedules the next run</strong>{" "}
+          automatically (default <code>AUTO_SEARCH_INTERVAL_MS=90000</code>). Each run uses the next GitHub Search page (cycles
+          within the 1000-result cap), rotates PATs per request, enriches users, and <strong>upserts into SQLite</strong>.{" "}
+          <strong>Pause</strong> stops the timer; <strong>Resume</strong> runs once immediately, then automatic scheduling
+          continues. <strong>Contacted</strong> = saved rows with a note.
         </p>
         <div
           style={{
@@ -234,7 +502,13 @@ export default function SearchPage() {
                 {stats.automated.perPage != null ? (
                   <>
                     {" "}
-                    (page size {stats.automated.perPage})
+                    (page size {stats.automated.perPage}
+                    {stats.automated.searchPage != null ? (
+                      <>
+                        , GitHub search page <strong>{stats.automated.searchPage}</strong>
+                      </>
+                    ) : null}
+                    )
                   </>
                 ) : null}
               </div>
@@ -267,9 +541,130 @@ export default function SearchPage() {
             <div style={{ fontSize: "0.8rem", color: "var(--muted)" }}>Saved profiles</div>
             <div style={{ fontSize: "1.5rem", fontWeight: 700, marginTop: "0.25rem" }}>{savedTotalDisplay.toLocaleString()}</div>
             <div style={{ fontSize: "0.75rem", color: "var(--muted)", marginTop: "0.25rem" }}>
-              Total rows in SQLite (with or without a note)
+              <strong>total_count</strong> = SQLite <code>COUNT(*)</code> (your saved rows). GitHub Search returns at most{" "}
+              <strong>{GITHUB_SEARCH_MAX_PER_PAGE}</strong> users per API page — your DB can grow beyond that.
             </div>
           </div>
+        </div>
+
+        <div
+          style={{
+            marginTop: "0.5rem",
+            padding: "0.75rem",
+            borderRadius: 8,
+            border: "1px solid var(--border)",
+            background: "var(--bg)",
+          }}
+        >
+          <strong style={{ fontSize: "0.9rem" }}>GitHub API &amp; automated-search timing</strong>
+          <p style={{ margin: "0.35rem 0 0.75rem", fontSize: "0.8rem", color: "var(--muted)" }}>
+            <strong>Automated search writes to SQLite</strong> on every successful run (same upsert as “Save to table”). The
+            backend <strong>queues the next run</strong> after each attempt (spacing from <code>AUTO_SEARCH_INTERVAL_MS</code>,
+            default 90s). PATs rotate on each API call; the GitHub Search <strong>page number</strong> advances each run so you
+            get different users when the index has more than one page. Rate limits below come from GitHub (
+            <code>X-RateLimit-*</code>).
+          </p>
+
+          {stats?.automatedCooldown ? (
+            <div style={{ marginBottom: "0.75rem", fontSize: "0.85rem" }}>
+              <div style={{ fontWeight: 600, marginBottom: "0.25rem" }}>Automated search (server-only spacing)</div>
+              <p style={{ margin: "0 0 0.5rem", color: "var(--muted)" }}>{stats.automatedCooldown.note}</p>
+              {stats.automatedCooldown.inCooldown && stats.automatedCooldown.nextAllowedAt ? (
+                <p style={{ margin: "0 0 0.35rem" }}>
+                  <strong>Spacing</strong> until another run can start:{" "}
+                  <strong style={{ color: "var(--accent)" }}>{formatDurationMs(automatedCooldownLeftMs)}</strong>
+                  <span style={{ color: "var(--muted)", marginLeft: "0.5rem" }}>
+                    (clock: {new Date(stats.automatedCooldown.nextAllowedAt).toLocaleTimeString()})
+                  </span>
+                </p>
+              ) : stats.automated?.ok && stats.automated.ranAt ? (
+                <p style={{ margin: "0 0 0.35rem", fontSize: "0.8rem", color: "var(--muted)" }}>
+                  Spacing window is open. Last success: {new Date(stats.automated.ranAt).toLocaleString()}.
+                  {stats.automaticSearchPaused ? (
+                    <> Automatic runs are paused — use Resume to continue.</>
+                  ) : stats.automatedCooldown.nextScheduledRunAt && nextAutoRunInMs != null ? (
+                    <>
+                      {" "}
+                      Next automatic run in{" "}
+                      <strong style={{ color: "var(--accent)" }}>{formatDurationMs(nextAutoRunInMs)}</strong> (
+                      {new Date(stats.automatedCooldown.nextScheduledRunAt).toLocaleString()}).
+                    </>
+                  ) : (
+                    <> Next run is queued after the last API attempt completes.</>
+                  )}
+                </p>
+              ) : (
+                <p style={{ margin: "0 0 0.35rem", fontSize: "0.8rem", color: "var(--muted)" }}>
+                  Spacing applies between successful runs. Fix errors above or run Search manually; when a run succeeds, the
+                  server schedules the next one automatically.
+                </p>
+              )}
+              {stats.automatedCooldown.lastRunAt ? (
+                <div style={{ fontSize: "0.75rem", color: "var(--muted)", marginTop: "0.25rem" }}>
+                  Last automated attempt: {new Date(stats.automatedCooldown.lastRunAt).toLocaleString()} · Profiles saved
+                  that run: {stats.automatedCooldown.lastSavedToDb ?? "—"}
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+
+          <div style={{ fontWeight: 600, marginBottom: "0.35rem", fontSize: "0.85rem" }}>
+            GitHub rate limits <span style={{ fontWeight: 400, color: "var(--muted)" }}>(per PAT)</span>
+          </div>
+          <p style={{ margin: "0 0 0.5rem", fontSize: "0.75rem", color: "var(--muted)" }}>
+            Each token has its <strong>own</strong> quota. Rows show the last response that used PAT ending in{" "}
+            <code>…suffix</code> for that resource (<code>core</code> vs <code>search</code>). Three PATs ⇒ up to three rows
+            per resource after traffic uses each token.
+          </p>
+          {!stats?.githubRateLimitsByToken?.length ? (
+            <p style={{ margin: 0, fontSize: "0.8rem", color: "var(--muted)" }}>
+              No per-token data yet — run a <strong>Search</strong> (uses multiple tokens) or wait for automated search.
+            </p>
+          ) : (
+            <div style={{ overflowX: "auto" }}>
+              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "0.8rem" }}>
+                <thead>
+                  <tr style={{ textAlign: "left", borderBottom: "1px solid var(--border)" }}>
+                    <th style={{ padding: "0.35rem" }}>PAT …</th>
+                    <th style={{ padding: "0.35rem" }}>Resource</th>
+                    <th style={{ padding: "0.35rem" }}>Remaining</th>
+                    <th style={{ padding: "0.35rem" }}>Limit</th>
+                    <th style={{ padding: "0.35rem" }}>Resets in</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {stats.githubRateLimitsByToken.map((r) => (
+                    <tr key={`${r.tokenSuffix}-${r.resource}`} style={{ borderBottom: "1px solid var(--border)" }}>
+                      <td style={{ padding: "0.35rem", fontFamily: "ui-monospace, monospace" }}>…{r.tokenSuffix}</td>
+                      <td style={{ padding: "0.35rem" }}>
+                        <code>{r.resource}</code>
+                      </td>
+                      <td style={{ padding: "0.35rem" }}>{r.remaining ?? "—"}</td>
+                      <td style={{ padding: "0.35rem" }}>{r.limit ?? "—"}</td>
+                      <td style={{ padding: "0.35rem" }}>
+                        {r.secondsUntilReset != null ? (
+                          <>
+                            <strong>{formatDurationMs(r.secondsUntilReset * 1000)}</strong>
+                            {r.resetAtIso ? (
+                              <span style={{ color: "var(--muted)", marginLeft: "0.35rem" }}>
+                                ({new Date(r.resetAtIso).toLocaleString()})
+                              </span>
+                            ) : null}
+                          </>
+                        ) : (
+                          "—"
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+          <p style={{ margin: "0.5rem 0 0", fontSize: "0.72rem", color: "var(--muted)" }}>
+            <code>search</code> = Search API; <code>core</code> = most REST (e.g. <code>/users/:login</code>). Panel polls
+            every 5s.
+          </p>
         </div>
       </section>
 
@@ -313,13 +708,15 @@ export default function SearchPage() {
             />
           </label>
           <label style={{ display: "grid", gap: "0.25rem" }}>
-            Per page (max 30)
+            Per page (max {GITHUB_SEARCH_MAX_PER_PAGE})
             <input
               type="number"
               min={1}
-              max={30}
+              max={GITHUB_SEARCH_MAX_PER_PAGE}
               value={perPage}
-              onChange={(e) => setPerPage(Math.min(30, Number(e.target.value) || 15))}
+              onChange={(e) =>
+                setPerPage(Math.min(GITHUB_SEARCH_MAX_PER_PAGE, Number(e.target.value) || 15))
+              }
               style={{ width: 100, padding: "0.35rem" }}
             />
           </label>
@@ -380,6 +777,49 @@ export default function SearchPage() {
             Save tokens on server
           </button>
         </details>
+
+        {loading ? (
+          <div
+            role="status"
+            aria-live="polite"
+            style={{
+              marginTop: "0.5rem",
+              padding: "0.75rem",
+              borderRadius: 8,
+              border: "1px solid var(--border)",
+              background: "var(--bg)",
+            }}
+          >
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "0.5rem", flexWrap: "wrap" }}>
+              <span style={{ fontWeight: 600 }}>Searching GitHub…</span>
+              <span style={{ fontFamily: "ui-monospace, monospace", color: "var(--muted)" }}>
+                {searchElapsedSec.toFixed(1)}s elapsed
+              </span>
+            </div>
+            <div
+              style={{
+                marginTop: "0.5rem",
+                height: 6,
+                borderRadius: 3,
+                background: "var(--border)",
+                overflow: "hidden",
+              }}
+            >
+              <div
+                style={{
+                  width: `${searchProgress}%`,
+                  height: "100%",
+                  background: "linear-gradient(90deg, var(--accent), #79c0ff)",
+                  borderRadius: 3,
+                  transition: "width 0.15s ease-out",
+                }}
+              />
+            </div>
+            <p style={{ margin: "0.5rem 0 0", fontSize: "0.8rem", color: "var(--muted)" }}>
+              Progress is approximate (GitHub rate limits / network). Time shows wall-clock duration for this request.
+            </p>
+          </div>
+        ) : null}
       </section>
 
       {error ? (
@@ -396,10 +836,11 @@ export default function SearchPage() {
       {result ? (
         <>
           <p style={{ color: "var(--muted)" }}>
-            Total matches (GitHub cap applies): <strong>{result.totalCount}</strong>
-            {result.incompleteResults ? " (incomplete_results)" : ""} · Tokens in pool:{" "}
-            <strong>{result.usedTokens}</strong> · Page <strong>{result.page}</strong> · Showing{" "}
-            <strong>{result.people.length}</strong>
+            GitHub index <strong>total_count</strong>: <strong>{result.totalCount.toLocaleString()}</strong>
+            {result.incompleteResults ? " (incomplete_results)" : ""} · This page: <strong>{result.people.length}</strong>{" "}
+            (max <strong>{GITHUB_SEARCH_MAX_PER_PAGE}</strong> per request) · Page <strong>{result.page}</strong> · Tokens:{" "}
+            <strong>{result.usedTokens}</strong> · <strong>Database total_count</strong> (saved rows):{" "}
+            <strong>{savedTotalDisplay.toLocaleString()}</strong>
           </p>
           <div style={{ marginBottom: "1rem", display: "flex", flexWrap: "wrap", gap: "0.75rem", alignItems: "center" }}>
             <button

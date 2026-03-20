@@ -2,9 +2,22 @@ import { Router } from "express";
 import { z } from "zod";
 import type { SearchResponse } from "../types.js";
 import { userToContact } from "../github/extractContact.js";
-import { GitHubClient, enrichLogins } from "../github/githubClient.js";
+import {
+  GitHubClient,
+  enrichLogins,
+  getPerTokenRateLimitSnapshots,
+  getRateLimitSnapshots,
+  withRateLimitTiming,
+} from "../github/githubClient.js";
 import { KeyPool, getAllTokens, setRuntimeTokens } from "../github/keyPool.js";
-import { getAutomatedSearchState, runAutomatedSearchOnStartup } from "../automatedSearch.js";
+import {
+  getAutomatedSearchCooldownInfo,
+  getAutomatedSearchState,
+  isAutomaticSearchPaused,
+  runAutomatedSearchOnStartup,
+  setAutomaticSearchPaused,
+} from "../automatedSearch.js";
+import { listRecentSearchProfiles, appendSearchResults } from "../searchHistoryRepo.js";
 import {
   countContacted,
   countSaved,
@@ -76,16 +89,40 @@ apiRouter.post("/tokens", (req, res) => {
   res.json({ ok: true, count: countAfter });
 
   // Startup auto-search runs before tokens exist if you only paste PATs in the UI. Run once when tokens first appear.
-  if (countBefore === 0 && countAfter > 0) {
+  if (countBefore === 0 && countAfter > 0 && !isAutomaticSearchPaused()) {
     setTimeout(() => {
       void runAutomatedSearchOnStartup();
     }, 400);
   }
 });
 
+apiRouter.get("/automated-search/control", (_req, res) => {
+  res.json({
+    paused: isAutomaticSearchPaused(),
+    envEnabled: process.env.AUTO_SEARCH_ENABLED !== "false",
+  });
+});
+
+apiRouter.post("/automated-search/pause", (_req, res) => {
+  setAutomaticSearchPaused(true);
+  res.json({ ok: true, paused: true });
+});
+
+apiRouter.post("/automated-search/resume", (_req, res) => {
+  setAutomaticSearchPaused(false);
+  /** Bypass 90s spacing so Resume always queues an immediate run; further runs use the automatic timer. */
+  void runAutomatedSearchOnStartup({ force: true });
+  res.json({ ok: true, paused: false, queued: true });
+});
+
 apiRouter.get("/stats", (_req, res) => {
   res.json({
     automated: getAutomatedSearchState(),
+    automatedCooldown: getAutomatedSearchCooldownInfo(),
+    automaticSearchPaused: isAutomaticSearchPaused(),
+    /** Legacy: last response per resource (any token). Prefer githubRateLimitsByToken. */
+    githubRateLimits: getRateLimitSnapshots().map(withRateLimitTiming),
+    githubRateLimitsByToken: getPerTokenRateLimitSnapshots().map(withRateLimitTiming),
     contactedCount: countContacted(),
     savedTotal: countSaved(),
   });
@@ -140,6 +177,20 @@ apiRouter.delete("/saved", (_req, res) => {
   res.json({ ok: true, deleted });
 });
 
+const searchHistoryQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(100).default(10),
+});
+
+apiRouter.get("/search/history", (req, res) => {
+  const parsed = searchHistoryQuerySchema.safeParse(req.query);
+  if (!parsed.success) {
+    res.status(400).json({ error: parsed.error.flatten() });
+    return;
+  }
+  const rows = listRecentSearchProfiles(parsed.data.limit);
+  res.json({ rows });
+});
+
 apiRouter.get("/search", async (req, res) => {
   const parsed = searchQuerySchema.safeParse(req.query);
   if (!parsed.success) {
@@ -161,6 +212,8 @@ apiRouter.get("/search", async (req, res) => {
     const concurrency = Math.min(10, Math.max(3, getAllTokens().length));
     const details = await enrichLogins(client, logins, concurrency);
     const people = details.map(userToContact);
+
+    appendSearchResults(q, people);
 
     const body: SearchResponse = {
       totalCount: search.total_count,

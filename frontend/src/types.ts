@@ -23,3 +23,12 @@ export interface SearchResponse {
   perPage: number;
   usedTokens: number;
 }
+
+/** One row per profile seen in a search result (manual or automated); newest first in API list. */
+export interface SearchHistoryRow {
+  id: number;
+  login: string;
+  query: string;
+  searchedAt: string;
+  person: PersonContact;
+}

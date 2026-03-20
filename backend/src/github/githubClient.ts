@@ -9,6 +9,75 @@ function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+/** Last seen GitHub REST rate limit per `X-RateLimit-Resource` (e.g. `core`, `search`). */
+export type RateLimitResourceSnapshot = {
+  resource: string;
+  limit: number | null;
+  remaining: number | null;
+  used: number | null;
+  /** Unix seconds (UTC) when the quota resets */
+  reset: number | null;
+  updatedAt: string;
+};
+
+const rateLimitByResource = new Map<string, RateLimitResourceSnapshot>();
+
+/** Last seen limits per PAT suffix + resource (each token has its own GitHub quota). */
+export type PerTokenRateLimitSnapshot = RateLimitResourceSnapshot & {
+  /** Last 6 chars of the token used for that request (identify which PAT). */
+  tokenSuffix: string;
+};
+
+const rateLimitByTokenResource = new Map<string, PerTokenRateLimitSnapshot>();
+
+function parseRateLimitSnapshot(headers: Headers): RateLimitResourceSnapshot {
+  const resource = headers.get("x-ratelimit-resource") ?? "unknown";
+  const lim = headers.get("x-ratelimit-limit");
+  const rem = headers.get("x-ratelimit-remaining");
+  const used = headers.get("x-ratelimit-used");
+  const reset = headers.get("x-ratelimit-reset");
+  return {
+    resource,
+    limit: lim ? parseInt(lim, 10) : null,
+    remaining: rem ? parseInt(rem, 10) : null,
+    used: used ? parseInt(used, 10) : null,
+    reset: reset ? parseInt(reset, 10) : null,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+/** Record limits from a response; pass the bearer token so we track quota per PAT. */
+function recordRateLimitFromResponse(headers: Headers, token: string) {
+  const snap = parseRateLimitSnapshot(headers);
+  rateLimitByResource.set(snap.resource, snap);
+
+  const tokenSuffix = token.length >= 6 ? token.slice(-6) : token;
+  const key = `${tokenSuffix}|${snap.resource}`;
+  rateLimitByTokenResource.set(key, { ...snap, tokenSuffix });
+}
+
+export function getRateLimitSnapshots(): RateLimitResourceSnapshot[] {
+  return [...rateLimitByResource.values()].sort((a, b) => a.resource.localeCompare(b.resource));
+}
+
+export function getPerTokenRateLimitSnapshots(): PerTokenRateLimitSnapshot[] {
+  return [...rateLimitByTokenResource.values()].sort((a, b) => {
+    const c = a.tokenSuffix.localeCompare(b.tokenSuffix);
+    return c !== 0 ? c : a.resource.localeCompare(b.resource);
+  });
+}
+
+export function withRateLimitTiming(s: RateLimitResourceSnapshot) {
+  const nowSec = Math.floor(Date.now() / 1000);
+  const reset = s.reset;
+  const secondsUntilReset = reset != null ? Math.max(0, reset - nowSec) : null;
+  return {
+    ...s,
+    secondsUntilReset,
+    resetAtIso: reset != null ? new Date(reset * 1000).toISOString() : null,
+  };
+}
+
 export class GitHubClient {
   constructor(private pool: KeyPool) {}
 
@@ -39,6 +108,8 @@ export class GitHubClient {
           ...(init.headers as Record<string, string>),
         },
       });
+
+      recordRateLimitFromResponse(res.headers, token);
 
       const reset = res.headers.get("x-ratelimit-reset");
       const resetSec = reset ? parseInt(reset, 10) : undefined;

@@ -30,6 +30,13 @@ export function getDb(): Database.Database {
         saved_at TEXT NOT NULL,
         person_json TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS search_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        login TEXT NOT NULL,
+        query TEXT NOT NULL,
+        searched_at TEXT NOT NULL,
+        person_json TEXT NOT NULL
+      );
     `);
   }
   return db;

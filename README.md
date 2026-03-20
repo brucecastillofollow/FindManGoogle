@@ -51,7 +51,10 @@ If you serve the static `frontend/dist` from another host, set `VITE_API_BASE_UR
 - `GET /api/search?q=...&page=1&perPage=15` — search + enrich profiles  
 - `POST /api/tokens` — body `{ "tokens": ["ghp_..."] }` merges tokens in **server memory** (optional; resets on restart)  
 - `GET /api/health` — `{ ok, tokenCount }`  
-- `GET /api/stats` — `{ automated, contactedCount, savedTotal }` — last automated search snapshot (from startup) + DB counts (`contactedCount` = saved rows with a non-empty note)  
+- `GET /api/stats` — automated snapshot, cooldown info, `automaticSearchPaused`, `githubRateLimits` (last response per resource), `githubRateLimitsByToken` (per PAT suffix + resource; each token has its own GitHub quota), DB counts  
+- `GET /api/automated-search/control` — `{ paused, envEnabled }`  
+- `POST /api/automated-search/pause` — pause automated search (skips startup / first-token triggers until resumed)  
+- `POST /api/automated-search/resume` — resume and **queue** an automated run immediately  
 - **Saved people (SQLite)**  
   - `GET /api/saved` — `{ rows: SavedPersonRow[] }`  
   - `PUT /api/saved/:login` — body `{ "person": PersonContact }` — insert or update profile snapshot; keeps existing **note** on update  
