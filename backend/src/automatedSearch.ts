@@ -1,3 +1,4 @@
+import { loadAutomatedSearchNextPage, saveAutomatedSearchNextPage } from "./autoSearchPageRepo.js";
 import { userToContact } from "./github/extractContact.js";
 import { GitHubClient, enrichLogins } from "./github/githubClient.js";
 import { KeyPool, getAllTokens } from "./github/keyPool.js";
@@ -98,9 +99,6 @@ function maxAccessibleSearchPage(totalCount: number, perPage: number): number {
   const accessible = Math.min(Math.max(0, totalCount), GITHUB_SEARCH_MAX_RESULTS);
   return Math.max(1, Math.ceil(accessible / pp));
 }
-
-/** Next GitHub Search `page` for automated runs (in-memory; cycles 1..maxPage). */
-let automatedSearchNextPage = 1;
 
 export function getNextScheduledAutoSearchAt(): string | null {
   return nextScheduledAutoSearchAt;
@@ -253,16 +251,27 @@ async function runAutomatedSearchOnce(force = false): Promise<void> {
   const client = new GitHubClient(pool);
 
   let attemptedSearch = false;
-  const page = Math.max(1, automatedSearchNextPage);
+  let page = Math.max(1, loadAutomatedSearchNextPage());
 
   try {
     attemptedSearch = true;
-    const search = await client.searchUsers(q, page, perPage);
+    let search = await client.searchUsers(q, page, perPage);
+    let maxPage = maxAccessibleSearchPage(search.total_count, perPage);
+
+    if (page > maxPage) {
+      console.log(
+        `[auto-search] persisted page ${page} > maxPage ${maxPage} (GitHub total_count=${search.total_count}); restarting from page 1`,
+      );
+      page = 1;
+      search = await client.searchUsers(q, 1, perPage);
+      maxPage = maxAccessibleSearchPage(search.total_count, perPage);
+    }
+
     const logins = search.items.map((i) => i.login);
-    const maxPage = maxAccessibleSearchPage(search.total_count, perPage);
 
     if (logins.length === 0) {
-      automatedSearchNextPage = page >= maxPage ? 1 : page + 1;
+      const nextPage = page >= maxPage ? 1 : page + 1;
+      saveAutomatedSearchNextPage(nextPage);
 
       state = {
         ok: true,
@@ -293,7 +302,8 @@ async function runAutomatedSearchOnce(force = false): Promise<void> {
 
     appendSearchResults(q, people);
 
-    automatedSearchNextPage = page >= maxPage ? 1 : page + 1;
+    const nextPage = page >= maxPage ? 1 : page + 1;
+    saveAutomatedSearchNextPage(nextPage);
 
     state = {
       ok: true,

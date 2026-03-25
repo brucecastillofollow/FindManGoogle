@@ -37,6 +37,10 @@ export function getDb(): Database.Database {
         searched_at TEXT NOT NULL,
         person_json TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS app_settings (
+        key TEXT PRIMARY KEY NOT NULL,
+        value TEXT NOT NULL
+      );
     `);
   }
   return db;
