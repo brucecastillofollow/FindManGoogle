@@ -1,4 +1,4 @@
-import { useMemo, useState, type CSSProperties } from "react";
+import { useEffect, useMemo, useState, type CSSProperties } from "react";
 import { Link } from "react-router-dom";
 import type { SavedPersonRow } from "../savedTypes";
 import { useSavedPeople } from "../SavedPeopleContext";
@@ -41,6 +41,8 @@ const emptyFilters = {
 export default function SavedTablePage() {
   const { rows, setNote, remove, clearAll, loading, error, refresh } = useSavedPeople();
   const [filters, setFilters] = useState(() => ({ ...emptyFilters }));
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(25);
 
   const sorted = useMemo(
     () => [...rows].sort((a, b) => b.savedAt.localeCompare(a.savedAt)),
@@ -52,10 +54,27 @@ export default function SavedTablePage() {
     [sorted, filters],
   );
 
+  const totalPages = useMemo(
+    () => Math.max(1, Math.ceil(filtered.length / pageSize)),
+    [filtered.length, pageSize],
+  );
+
+  const currentPage = Math.min(page, totalPages);
+
+  const paged = useMemo(() => {
+    const start = (currentPage - 1) * pageSize;
+    return filtered.slice(start, start + pageSize);
+  }, [filtered, currentPage, pageSize]);
+
   const hasActiveFilters = useMemo(
     () => Object.values(filters).some((v) => v.trim().length > 0),
     [filters],
   );
+
+  // Keep current page valid when filters/data/page size change.
+  useEffect(() => {
+    if (page !== currentPage) setPage(currentPage);
+  }, [page, currentPage]);
 
   const inputStyle: CSSProperties = {
     width: "100%",
@@ -134,6 +153,47 @@ export default function SavedTablePage() {
                 </>
               )}
             </span>
+            <label style={{ display: "inline-flex", alignItems: "center", gap: "0.35rem", color: "var(--muted)" }}>
+              Page size
+              <select
+                value={pageSize}
+                onChange={(e) => {
+                  setPageSize(Math.max(1, Number.parseInt(e.target.value, 10) || 25));
+                  setPage(1);
+                }}
+                style={{ padding: "0.25rem 0.4rem", borderRadius: 6 }}
+              >
+                <option value={10}>10</option>
+                <option value={25}>25</option>
+                <option value={50}>50</option>
+                <option value={100}>100</option>
+              </select>
+            </label>
+            <div style={{ display: "inline-flex", alignItems: "center", gap: "0.35rem" }}>
+              <button
+                type="button"
+                disabled={currentPage <= 1}
+                onClick={() => setPage((p) => Math.max(1, p - 1))}
+                style={{ padding: "0.25rem 0.6rem", borderRadius: 6, cursor: currentPage <= 1 ? "not-allowed" : "pointer" }}
+              >
+                Prev
+              </button>
+              <span style={{ color: "var(--muted)", minWidth: 100, textAlign: "center" }}>
+                Page <strong>{currentPage}</strong> / {totalPages}
+              </span>
+              <button
+                type="button"
+                disabled={currentPage >= totalPages}
+                onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+                style={{
+                  padding: "0.25rem 0.6rem",
+                  borderRadius: 6,
+                  cursor: currentPage >= totalPages ? "not-allowed" : "pointer",
+                }}
+              >
+                Next
+              </button>
+            </div>
             <button
               type="button"
               onClick={() => {
@@ -246,7 +306,7 @@ export default function SavedTablePage() {
                 </tr>
               </thead>
               <tbody>
-                {filtered.map((row) => {
+                {paged.map((row) => {
                   const p = row.person;
                   return (
                     <tr key={row.login} style={{ borderBottom: "1px solid var(--border)" }}>
@@ -329,6 +389,15 @@ export default function SavedTablePage() {
                 })}
               </tbody>
             </table>
+          </div>
+          <div style={{ marginTop: "0.75rem", display: "flex", justifyContent: "space-between", color: "var(--muted)" }}>
+            <span>
+              Showing {(filtered.length === 0 ? 0 : (currentPage - 1) * pageSize + 1).toLocaleString()}-
+              {Math.min(currentPage * pageSize, filtered.length).toLocaleString()} of {filtered.length.toLocaleString()}
+            </span>
+            <span>
+              Page <strong>{currentPage}</strong> / {totalPages}
+            </span>
           </div>
 
           <details style={{ marginTop: "1rem", fontSize: "0.85rem", color: "var(--muted)" }}>

@@ -1,9 +1,9 @@
-import { loadAutomatedSearchNextPage, saveAutomatedSearchNextPage } from "./autoSearchPageRepo.js";
 import { userToContact } from "./github/extractContact.js";
 import { GitHubClient, enrichLogins } from "./github/githubClient.js";
 import { KeyPool, getAllTokens } from "./github/keyPool.js";
 import { appendSearchResults } from "./searchHistoryRepo.js";
 import { upsertPersonSnapshot } from "./savedRepo.js";
+import { loadAutoSearchActive, loadAutoSearchQueue, saveAutoSearchActive, saveAutoSearchQueue } from "./autoSearchQueueRepo.js";
 
 /** Default spacing between automated runs (override with `AUTO_SEARCH_INTERVAL_MS`). */
 export const AUTOMATED_SEARCH_SUCCESS_COOLDOWN_MS = 90_000;
@@ -35,6 +35,57 @@ let state: AutomatedSearchState = {
   savedToDbCount: null,
   searchPage: null,
 };
+
+const DEFAULT_CREATED_FROM = "2008-01-01";
+function utcTodayYmd(): string {
+  // Use UTC to keep created: slicing stable regardless of local timezone.
+  return new Date().toISOString().slice(0, 10);
+}
+
+function stripCreatedFilter(q: string): string {
+  // Matches: created:YYYY-MM-DD..YYYY-MM-DD (GitHub-style date range).
+  const stripped = q.replace(/\bcreated:\s*\d{4}-\d{2}-\d{2}\.\.\d{4}-\d{2}-\d{2}\b/gi, "").trim();
+  return stripped.replace(/\s+/g, " ");
+}
+
+function parseCreatedRange(q: string): { from: string; to: string } | null {
+  const m = q.match(/\bcreated:\s*(\d{4}-\d{2}-\d{2})\.\.(\d{4}-\d{2}-\d{2})\b/i);
+  if (!m) return null;
+  return { from: m[1]!, to: m[2]! };
+}
+
+function joinQueryCoreWithCreated(core: string, from: string, to: string): string {
+  const created = `created:${from}..${to}`;
+  if (!core || core.trim() === "") return created;
+  return `${core} ${created}`;
+}
+
+function canSplitCreatedRange(from: string, to: string): boolean {
+  // If the range is a single day, splitting would either overlap or be identical and can loop forever.
+  return from !== to;
+}
+
+function splitCreatedRangeInTwo(
+  rangeFrom: string,
+  rangeTo: string,
+): { olderFrom: string; olderTo: string; newerFrom: string; newerTo: string } {
+  const dayMs = 86_400_000;
+  // Convert to UTC day indices.
+  const d0 = Math.floor(new Date(`${rangeFrom}T00:00:00.000Z`).getTime() / dayMs);
+  const d1 = Math.floor(new Date(`${rangeTo}T00:00:00.000Z`).getTime() / dayMs);
+  const lo = Math.min(d0, d1);
+  const hi = Math.max(d0, d1);
+
+  const days = hi - lo + 1;
+  const mid = Math.floor(days / 2); // older covers [lo, lo+mid-1]
+
+  const olderFrom = new Date(lo * dayMs).toISOString().slice(0, 10);
+  const olderTo = new Date((lo + mid - 1) * dayMs).toISOString().slice(0, 10);
+  const newerFrom = new Date((lo + mid) * dayMs).toISOString().slice(0, 10);
+  const newerTo = new Date(hi * dayMs).toISOString().slice(0, 10);
+
+  return { olderFrom, olderTo, newerFrom, newerTo };
+}
 
 export function getAutomatedSearchState(): AutomatedSearchState {
   return { ...state };
@@ -186,8 +237,10 @@ export function runAutomatedSearchOnStartup(opts?: RunAutomatedSearchOptions): P
 
 async function runAutomatedSearchOnce(force = false): Promise<void> {
   const enabled = process.env.AUTO_SEARCH_ENABLED !== "false";
-  const q = process.env.AUTO_SEARCH_QUERY?.trim() || DEFAULT_QUERY;
   const perPage = getAutoSearchPerPage();
+  const baseQuery = process.env.AUTO_SEARCH_QUERY?.trim() || DEFAULT_QUERY;
+  const createdFromDefault = process.env.AUTO_SEARCH_CREATED_FROM?.trim() || DEFAULT_CREATED_FROM;
+  const createdToDefault = process.env.AUTO_SEARCH_CREATED_TO?.trim() || utcTodayYmd();
 
   if (!force && state.ok && state.ranAt && !state.error) {
     const spacingMs = getAutoSearchIntervalMs();
@@ -213,7 +266,7 @@ async function runAutomatedSearchOnce(force = false): Promise<void> {
   if (!enabled) {
     state = {
       ok: false,
-      query: q,
+      query: baseQuery,
       totalCount: null,
       incompleteResults: null,
       ranAt: new Date().toISOString(),
@@ -234,7 +287,7 @@ async function runAutomatedSearchOnce(force = false): Promise<void> {
   if (getAllTokens().length === 0) {
     state = {
       ok: false,
-      query: q,
+      query: baseQuery,
       totalCount: null,
       incompleteResults: null,
       ranAt: new Date().toISOString(),
@@ -251,86 +304,211 @@ async function runAutomatedSearchOnce(force = false): Promise<void> {
   const client = new GitHubClient(pool);
 
   let attemptedSearch = false;
-  let page = Math.max(1, loadAutomatedSearchNextPage());
-
   try {
     attemptedSearch = true;
-    let search = await client.searchUsers(q, page, perPage);
-    let maxPage = maxAccessibleSearchPage(search.total_count, perPage);
 
-    if (page > maxPage) {
-      console.log(
-        `[auto-search] persisted page ${page} > maxPage ${maxPage} (GitHub total_count=${search.total_count}); restarting from page 1`,
-      );
-      page = 1;
-      search = await client.searchUsers(q, 1, perPage);
-      maxPage = maxAccessibleSearchPage(search.total_count, perPage);
+    const baseCreatedParsed = parseCreatedRange(baseQuery);
+    const splitRangeFrom = baseCreatedParsed?.from ?? createdFromDefault;
+    const splitRangeTo = baseCreatedParsed?.to ?? createdToDefault;
+
+    // Queue algorithm:
+    // - If we have an active paging task, keep paging it.
+    // - Otherwise, pop the oldest queued task, probe total_count, and either split or start paging it.
+    let queue = loadAutoSearchQueue().sort((a, b) => a.rangeFrom.localeCompare(b.rangeFrom));
+    let active = loadAutoSearchActive();
+
+    if (!active && queue.length === 0) {
+      // Initialize queue with a single “probe” task (default query).
+      queue = [
+        {
+          q: baseQuery,
+          rangeFrom: splitRangeFrom,
+          rangeTo: splitRangeTo,
+        },
+      ];
+      saveAutoSearchQueue(queue);
     }
 
-    const logins = search.items.map((i) => i.login);
+    // Ensure we keep the "core" query consistent for splitting.
+    const baseCore = stripCreatedFilter(baseQuery);
 
-    if (logins.length === 0) {
-      const nextPage = page >= maxPage ? 1 : page + 1;
-      saveAutomatedSearchNextPage(nextPage);
+    if (active) {
+      const page = Math.max(1, Math.floor(active.page));
+      const totalCount = active.totalCount;
+      const maxPage = maxAccessibleSearchPage(totalCount, perPage);
+
+      // Safety: if we somehow got an invalid page beyond max, reset to 1.
+      const pageToRun = page > maxPage ? 1 : page;
+      const q = active.q;
+
+      let search = await client.searchUsers(q, pageToRun, perPage);
+      // Use stored totalCount for decision; refresh incomplete_results for UI.
+      const logins = search.items.map((i) => i.login);
+
+      let savedToDbCount = 0;
+      if (logins.length > 0) {
+        const concurrency = Math.min(10, Math.max(3, getAllTokens().length));
+        const details = await enrichLogins(client, logins, concurrency);
+        const people = details.map(userToContact);
+        for (const person of people) {
+          upsertPersonSnapshot(person);
+          savedToDbCount++;
+        }
+        appendSearchResults(q, people);
+      }
+
+      const nextPage = pageToRun >= maxPage ? null : pageToRun + 1;
+      if (nextPage == null) {
+        saveAutoSearchActive(null);
+      } else {
+        saveAutoSearchActive({ ...active, page: nextPage });
+      }
 
       state = {
         ok: true,
         query: q,
-        totalCount: search.total_count,
+        totalCount,
         incompleteResults: search.incomplete_results,
         ranAt: new Date().toISOString(),
         error: null,
         perPage,
-        savedToDbCount: 0,
-        searchPage: page,
+        savedToDbCount,
+        searchPage: pageToRun,
       };
+
       console.log(
-        `[auto-search] ok total_count=${search.total_count} saved=0 (no items) page=${page} q=${q.slice(0, 80)}…`,
+        `[auto-search] ok active total_count=${totalCount} saved_to_db=${savedToDbCount} page=${pageToRun}/${maxPage} per_page=${perPage} q=${q.slice(0, 80)}…`,
       );
       return;
     }
 
-    const concurrency = Math.min(10, Math.max(3, getAllTokens().length));
-    const details = await enrichLogins(client, logins, concurrency);
-    const people = details.map(userToContact);
-
-    let savedToDbCount = 0;
-    for (const person of people) {
-      upsertPersonSnapshot(person);
-      savedToDbCount++;
+    // Pop the oldest queue item.
+    queue = loadAutoSearchQueue().sort((a, b) => a.rangeFrom.localeCompare(b.rangeFrom));
+    if (queue.length === 0) {
+      // Should not happen because we initialize above, but be defensive.
+      saveAutoSearchQueue([
+        {
+          q: baseQuery,
+          rangeFrom: splitRangeFrom,
+          rangeTo: splitRangeTo,
+        },
+      ]);
+      state = {
+        ok: false,
+        query: baseQuery,
+        totalCount: null,
+        incompleteResults: null,
+        ranAt: new Date().toISOString(),
+        error: "Auto-search queue was empty; reinitialized. No work performed this run.",
+        perPage,
+        savedToDbCount: null,
+        searchPage: null,
+      };
+      return;
     }
 
-    appendSearchResults(q, people);
+    const item = queue.shift()!;
 
-    const nextPage = page >= maxPage ? 1 : page + 1;
-    saveAutomatedSearchNextPage(nextPage);
+    // Probe total_count with a cheap call (page 1, per_page 1).
+    const probe = await client.searchUsers(item.q, 1, 1);
+    const totalCount = probe.total_count;
+
+    if (totalCount > 1000 && canSplitCreatedRange(item.rangeFrom, item.rangeTo)) {
+      const core = stripCreatedFilter(item.q) || baseCore;
+
+      const { olderFrom, olderTo, newerFrom, newerTo } = splitCreatedRangeInTwo(item.rangeFrom, item.rangeTo);
+
+      const olderQ = joinQueryCoreWithCreated(core, olderFrom, olderTo);
+      const newerQ = joinQueryCoreWithCreated(core, newerFrom, newerTo);
+
+      queue.push(
+        { q: olderQ, rangeFrom: olderFrom, rangeTo: olderTo },
+        { q: newerQ, rangeFrom: newerFrom, rangeTo: newerTo },
+      );
+      queue.sort((a, b) => a.rangeFrom.localeCompare(b.rangeFrom));
+      saveAutoSearchQueue(queue);
+
+      state = {
+        ok: true,
+        query: item.q,
+        totalCount,
+        incompleteResults: probe.incomplete_results,
+        ranAt: new Date().toISOString(),
+        error: null,
+        perPage,
+        savedToDbCount: 0,
+        searchPage: 1,
+      };
+
+      console.log(
+        `[auto-search] ok probe split total_count=${totalCount} split=(${item.rangeFrom}..${item.rangeTo}) queue=${queue.length} q=${item.q.slice(0, 80)}…`,
+      );
+      return;
+    }
+
+    // total_count <= 1000 (or cannot split): start paging this popped item now.
+    const maxPage = maxAccessibleSearchPage(totalCount, perPage);
+    const pageToRun = 1;
+    const q = item.q;
+
+    let search = await client.searchUsers(q, pageToRun, perPage);
+    const logins = search.items.map((i) => i.login);
+
+    let savedToDbCount = 0;
+    if (logins.length > 0) {
+      const concurrency = Math.min(10, Math.max(3, getAllTokens().length));
+      const details = await enrichLogins(client, logins, concurrency);
+      const people = details.map(userToContact);
+      for (const person of people) {
+        upsertPersonSnapshot(person);
+        savedToDbCount++;
+      }
+      appendSearchResults(q, people);
+    }
+
+    if (pageToRun >= maxPage) {
+      // Commit queue removal + mark as finished (no active paging).
+      saveAutoSearchQueue(queue);
+      saveAutoSearchActive(null);
+    } else {
+      // Commit queue removal + mark as active paging.
+      saveAutoSearchQueue(queue);
+      saveAutoSearchActive({
+        q,
+        rangeFrom: item.rangeFrom,
+        rangeTo: item.rangeTo,
+        totalCount,
+        page: pageToRun + 1,
+      });
+    }
 
     state = {
       ok: true,
       query: q,
-      totalCount: search.total_count,
+      totalCount,
       incompleteResults: search.incomplete_results,
       ranAt: new Date().toISOString(),
       error: null,
       perPage,
       savedToDbCount,
-      searchPage: page,
+      searchPage: pageToRun,
     };
+
     console.log(
-      `[auto-search] ok total_count=${search.total_count} saved_to_db=${savedToDbCount} page=${page}/${maxPage} per_page=${perPage} q=${q.slice(0, 80)}…`,
+      `[auto-search] ok page1 total_count=${totalCount} saved_to_db=${savedToDbCount} page=${pageToRun}/${maxPage} per_page=${perPage} q=${q.slice(0, 80)}…`,
     );
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     state = {
       ok: false,
-      query: q,
+      query: baseQuery,
       totalCount: null,
       incompleteResults: null,
       ranAt: new Date().toISOString(),
       error: msg,
       perPage,
       savedToDbCount: null,
-      searchPage: attemptedSearch ? page : null,
+      searchPage: null,
     };
     console.warn(`[auto-search] failed: ${msg}`);
   } finally {
